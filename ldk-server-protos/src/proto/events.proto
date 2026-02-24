@@ -9,6 +9,8 @@ message EventEnvelope {
     PaymentSuccessful payment_successful = 3;
     PaymentFailed payment_failed = 4;
     PaymentForwarded payment_forwarded = 6;
+    ChannelStateChange channel_state_change = 8;
+    ChannelClosed channel_closed = 9;
   }
 }
 
@@ -33,4 +35,152 @@ message PaymentFailed {
 // PaymentForwarded indicates a payment was forwarded through the node.
 message PaymentForwarded {
   types.ForwardedPayment forwarded_payment = 1;
+}
+
+// ChannelStateChange indicates a channel state has changed (pending, ready, closed, etc.)
+message ChannelStateChange {
+  // The channel details.
+  types.Channel channel = 1;
+  // The state the channel has transitioned to.
+  ChannelState state = 2;
+}
+
+// Enum representing possible channel states.
+enum ChannelState {
+  // Channel is pending and awaiting funding transaction confirmation.
+  PENDING = 0;
+  // Channel is ready and can be used for payments.
+  READY = 1;
+  // Channel is closed.
+  CLOSED = 2;
+}
+
+// ChannelClosed indicates a channel has been closed.
+message ChannelClosed {
+  // The channel ID that was closed.
+  string channel_id = 1;
+  // The user channel ID.
+  string user_channel_id = 2;
+  // The counterparty node ID.
+  string counterparty_node_id = 3;
+  // Whether this was a force close.
+  bool is_force_close = 4;
+  // Who initiated the close.
+  CloseInitiator initiator = 5;
+  // The detailed closure reason.
+  ClosureReason closure_reason = 6;
+  // Human-readable description of why the channel was closed.
+  string reason_description = 7;
+  // Whether this was an open failure (channel never became ready).
+  bool is_open_failure = 8;
+}
+
+// Who initiated the channel close.
+enum CloseInitiator {
+  // Initiator unknown or not specified.
+  UNKNOWN = 0;
+  // The counterparty (remote node) initiated the close.
+  COUNTERPARTY = 1;
+  // We (the local node) initiated the close.
+  LOCAL = 2;
+}
+
+// Closure reason details.
+message ClosureReason {
+  oneof reason {
+    // Counterparty force-closed the channel.
+    CounterpartyForceClosed counterparty_force_closed = 1;
+    // We force-closed the channel.
+    HolderForceClosed holder_force_closed = 2;
+    // Channel was cooperatively closed.
+    CooperativeClosure cooperative_closure = 3;
+    // Commitment transaction was confirmed on-chain.
+    CommitmentTxConfirmed commitment_tx_confirmed = 4;
+    // Funding transaction failed to confirm in time.
+    FundingTimedOut funding_timed_out = 5;
+    // Error during processing (HTLC forward/relay/reception).
+    ProcessingError processing_error = 6;
+    // Peer disconnected before funding completed.
+    DisconnectedPeer disconnected_peer = 7;
+    // ChannelManager was outdated compared to ChannelMonitor.
+    OutdatedChannelManager outdated_channel_manager = 8;
+    // Counterparty closed unfunded channel cooperatively.
+    CounterpartyCoopClosedUnfunded counterparty_coop_closed_unfunded = 9;
+    // We closed unfunded channel cooperatively.
+    LocallyCoopClosedUnfunded locally_coop_closed_unfunded = 10;
+    // Funding batch closure.
+    FundingBatchClosure funding_batch_closure = 11;
+    // HTLCs timed out causing force close.
+    HtlcsTimedOut htlcs_timed_out = 12;
+    // Peer provided feerate that was too low.
+    PeerFeerateTooLow peer_feerate_too_low = 13;
+  }
+}
+
+// Counterparty force-closed the channel.
+message CounterpartyForceClosed {
+  // The error message from the peer (use with caution).
+  string peer_message = 1;
+}
+
+// We force-closed the channel.
+message HolderForceClosed {
+  // Whether the latest transaction was broadcast.
+  bool broadcasted_latest_txn = 1;
+  // The error message provided when force-closing.
+  string message = 2;
+}
+
+// Channel was cooperatively closed.
+message CooperativeClosure {
+  // Who initiated the cooperative close.
+  CloseInitiator initiator = 1;
+}
+
+// Commitment transaction was confirmed on-chain.
+message CommitmentTxConfirmed {
+}
+
+// Funding transaction failed to confirm in time.
+message FundingTimedOut {
+}
+
+// Error during processing.
+message ProcessingError {
+  // The error message.
+  string error = 1;
+}
+
+// Peer disconnected before funding completed.
+message DisconnectedPeer {
+}
+
+// ChannelManager was outdated.
+message OutdatedChannelManager {
+}
+
+// Counterparty closed unfunded channel.
+message CounterpartyCoopClosedUnfunded {
+}
+
+// We closed unfunded channel.
+message LocallyCoopClosedUnfunded {
+}
+
+// Funding batch closure.
+message FundingBatchClosure {
+}
+
+// HTLCs timed out.
+message HtlcsTimedOut {
+  // The payment hash that timed out.
+  string payment_hash = 1;
+}
+
+// Peer feerate was too low.
+message PeerFeerateTooLow {
+  // The peer's feerate (sat/kw).
+  uint32 peer_feerate_sat_per_kw = 1;
+  // The required feerate (sat/kw).
+  uint32 required_feerate_sat_per_kw = 2;
 }

@@ -25,6 +25,7 @@ use hyper_util::rt::TokioIo;
 use ldk_node::bitcoin::Network;
 use ldk_node::config::Config;
 use ldk_node::entropy::NodeEntropy;
+use ldk_node::lightning::events::ClosureReason;
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::{Builder, Event, Node};
 use ldk_server_protos::events;
@@ -50,7 +51,7 @@ use crate::io::persist::{
 use crate::service::NodeService;
 use crate::util::config::{load_config, ArgsConfig, ChainSource};
 use crate::util::logger::ServerLogger;
-use crate::util::proto_adapter::{forwarded_payment_to_proto, payment_to_proto};
+use crate::util::proto_adapter::{channel_to_proto, forwarded_payment_to_proto, payment_to_proto};
 use crate::util::tls::get_or_generate_tls_config;
 
 const API_KEY_FILE: &str = "api_key";
@@ -216,10 +217,15 @@ fn main() {
 
 	#[cfg(feature = "events-rabbitmq")]
 	let event_publisher: Arc<dyn EventPublisher> = {
+		info!("RabbitMQ event publisher enabled");
 		let rabbitmq_config = RabbitMqConfig {
 			connection_string: config_file.rabbitmq_connection_string,
 			exchange_name: config_file.rabbitmq_exchange_name,
 		};
+		info!(
+			"RabbitMQ config: exchange={}, connection={}",
+			rabbitmq_config.exchange_name, rabbitmq_config.connection_string
+		);
 		Arc::new(RabbitMqEventPublisher::new(rabbitmq_config))
 	};
 
@@ -273,6 +279,9 @@ fn main() {
 		let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 		info!("TLS enabled for REST service on {}", config_file.rest_service_addr);
 
+		// Track which channels have become ready (to distinguish open failures from established channel closes)
+		let ready_channels = Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
+
 		loop {
 			select! {
 				event = event_node.next_event_async() => {
@@ -282,6 +291,24 @@ fn main() {
 								"CHANNEL_PENDING: {} from counterparty {}",
 								channel_id, counterparty_node_id
 							);
+
+							// Find the channel details and publish event
+							if let Some(channel_details) = event_node.list_channels().into_iter().find(|c| c.channel_id == channel_id) {
+								let channel = channel_to_proto(channel_details);
+								let event = event_envelope::Event::ChannelStateChange(events::ChannelStateChange {
+									channel: Some(channel),
+									state: events::ChannelState::Pending as i32,
+								});
+								match event_publisher.publish(EventEnvelope { event: Some(event) }).await {
+									Ok(_) => {},
+									Err(e) => {
+										error!("Failed to publish 'ChannelStateChange(Pending)' event: {}", e);
+									},
+								}
+							} else {
+								error!("Unable to find channel with channel_id: {channel_id}");
+							}
+
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
@@ -291,6 +318,77 @@ fn main() {
 								"CHANNEL_READY: {} from counterparty {:?}",
 								channel_id, counterparty_node_id
 							);
+
+							// Mark channel as ready
+							ready_channels.write().await.insert(channel_id);
+
+							// Find the channel details and publish event
+							if let Some(channel_details) = event_node.list_channels().into_iter().find(|c| c.channel_id == channel_id) {
+								let channel = channel_to_proto(channel_details);
+								let event = event_envelope::Event::ChannelStateChange(events::ChannelStateChange {
+									channel: Some(channel),
+									state: events::ChannelState::Ready as i32,
+								});
+								match event_publisher.publish(EventEnvelope { event: Some(event) }).await {
+									Ok(_) => {},
+									Err(e) => {
+										error!("Failed to publish 'ChannelStateChange(Ready)' event: {}", e);
+									},
+								}
+							} else {
+								error!("Unable to find channel with channel_id: {channel_id}");
+							}
+
+							if let Err(e) = event_node.event_handled() {
+								error!("Failed to mark event as handled: {e}");
+							}
+						},
+						Event::ChannelClosed { channel_id, user_channel_id, counterparty_node_id, reason } => {
+							info!(
+								"CHANNEL_CLOSED: channel_id={} user_channel_id={} counterparty={:?}",
+								channel_id, user_channel_id, counterparty_node_id
+							);
+
+						// Check if this channel ever became ready
+						let was_ready = ready_channels.read().await.contains(&channel_id);
+
+						// Convert LDK ClosureReason to proto ClosureReason
+							let (closure_reason, is_force_close, initiator, reason_description, base_is_open_failure) =
+								convert_closure_reason(&reason);
+
+							// Channel is an open failure if it never became ready OR if the reason explicitly indicates open failure
+							let is_open_failure = !was_ready || base_is_open_failure;
+
+							// Remove from tracking set
+							ready_channels.write().await.remove(&channel_id);
+
+							debug!(
+								"DEBUG ChannelClosed: was_ready={}, is_force_close={}, initiator={:?}, is_open_failure={}, reason={}",
+								was_ready, is_force_close, initiator, is_open_failure, reason_description
+							);
+
+							let channel_closed_event = events::ChannelClosed {
+								channel_id: channel_id.to_string(),
+								user_channel_id: user_channel_id.0.to_string(),
+								counterparty_node_id: counterparty_node_id.map(|pk| pk.to_string()).unwrap_or_default(),
+								is_force_close,
+								initiator: initiator as i32,
+								closure_reason: Some(closure_reason),
+								reason_description: reason_description.clone(),
+								is_open_failure,
+							};
+
+							let event = event_envelope::Event::ChannelClosed(channel_closed_event);
+							debug!("DEBUG: Publishing ChannelClosed event to RabbitMQ...");
+							match event_publisher.publish(EventEnvelope { event: Some(event) }).await {
+								Ok(_) => {
+									info!("Successfully published ChannelClosed event to RabbitMQ");
+								},
+								Err(e) => {
+									error!("Failed to publish 'ChannelClosed' event: {}", e);
+								},
+							}
+
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
@@ -498,6 +596,196 @@ fn upsert_payment_details(
 		Err(e) => {
 			error!("Failed to write payment to persistence: {e}");
 		},
+	}
+}
+
+/// Converts LDK ClosureReason to proto ClosureReason.
+fn convert_closure_reason(
+	ldk_reason: &Option<ClosureReason>,
+) -> (events::ClosureReason, bool, events::CloseInitiator, String, bool) {
+	use events::closure_reason::Reason as ProtoReason;
+	use events::{
+		CloseInitiator, CooperativeClosure, CounterpartyCoopClosedUnfunded,
+		CounterpartyForceClosed, DisconnectedPeer, FundingBatchClosure, FundingTimedOut,
+		HolderForceClosed, HtlcsTimedOut, LocallyCoopClosedUnfunded, OutdatedChannelManager,
+		PeerFeerateTooLow, ProcessingError,
+	};
+
+	let default_reason =
+		events::ClosureReason { reason: Some(ProtoReason::DisconnectedPeer(DisconnectedPeer {})) };
+
+	match ldk_reason {
+		Some(ClosureReason::CounterpartyForceClosed { peer_msg }) => {
+			let reason = ProtoReason::CounterpartyForceClosed(CounterpartyForceClosed {
+				peer_message: peer_msg.to_string(),
+			});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				true,
+				CloseInitiator::Counterparty,
+				format!("Counterparty force-closed: {}", peer_msg),
+				false, // Will be overridden by checking if channel was ever ready
+			)
+		},
+		Some(ClosureReason::HolderForceClosed { broadcasted_latest_txn, message }) => {
+			let reason = ProtoReason::HolderForceClosed(HolderForceClosed {
+				broadcasted_latest_txn: broadcasted_latest_txn.unwrap_or(false),
+				message: message.clone(),
+			});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				true,
+				CloseInitiator::Local,
+				format!("We force-closed: {}", message),
+				false,
+			)
+		},
+		Some(ClosureReason::LegacyCooperativeClosure)
+		| Some(ClosureReason::CounterpartyInitiatedCooperativeClosure) => {
+			let reason = ProtoReason::CooperativeClosure(CooperativeClosure {
+				initiator: CloseInitiator::Counterparty as i32,
+			});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Counterparty,
+				"Counterparty initiated cooperative close".to_string(),
+				false,
+			)
+		},
+		Some(ClosureReason::LocallyInitiatedCooperativeClosure) => {
+			let reason = ProtoReason::CooperativeClosure(CooperativeClosure {
+				initiator: CloseInitiator::Local as i32,
+			});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Local,
+				"We initiated cooperative close".to_string(),
+				false,
+			)
+		},
+		Some(ClosureReason::CommitmentTxConfirmed) => {
+			let reason = ProtoReason::CommitmentTxConfirmed(events::CommitmentTxConfirmed {});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				true,
+				CloseInitiator::Unknown,
+				"Commitment transaction confirmed on-chain (likely force close)".to_string(),
+				false,
+			)
+		},
+		Some(ClosureReason::FundingTimedOut) => {
+			let reason = ProtoReason::FundingTimedOut(FundingTimedOut {});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Unknown,
+				"Funding transaction timed out - channel open failed".to_string(),
+				true,
+			)
+		},
+		Some(ClosureReason::ProcessingError { err }) => {
+			let reason = ProtoReason::ProcessingError(ProcessingError { error: err.clone() });
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Unknown,
+				format!("Processing error: {}", err),
+				false,
+			)
+		},
+		Some(ClosureReason::DisconnectedPeer) => {
+			let reason = ProtoReason::DisconnectedPeer(DisconnectedPeer {});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Unknown,
+				"Peer disconnected before funding completed - channel open failed".to_string(),
+				true,
+			)
+		},
+		Some(ClosureReason::OutdatedChannelManager) => {
+			let reason = ProtoReason::OutdatedChannelManager(OutdatedChannelManager {});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Unknown,
+				"Outdated channel manager".to_string(),
+				false,
+			)
+		},
+		Some(ClosureReason::CounterpartyCoopClosedUnfundedChannel) => {
+			let reason =
+				ProtoReason::CounterpartyCoopClosedUnfunded(CounterpartyCoopClosedUnfunded {});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Counterparty,
+				"Counterparty closed unfunded channel - channel open failed".to_string(),
+				true,
+			)
+		},
+		Some(ClosureReason::LocallyCoopClosedUnfundedChannel) => {
+			let reason = ProtoReason::LocallyCoopClosedUnfunded(LocallyCoopClosedUnfunded {});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Local,
+				"We closed unfunded channel - channel open failed".to_string(),
+				true,
+			)
+		},
+		Some(ClosureReason::FundingBatchClosure) => {
+			let reason = ProtoReason::FundingBatchClosure(FundingBatchClosure {});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Unknown,
+				"Funding batch closure - channel open failed".to_string(),
+				true,
+			)
+		},
+		Some(ClosureReason::HTLCsTimedOut { payment_hash }) => {
+			let payment_hash_str =
+				payment_hash.as_ref().map(|ph| ph.0.to_lower_hex_string()).unwrap_or_default();
+			let reason = ProtoReason::HtlcsTimedOut(HtlcsTimedOut {
+				payment_hash: payment_hash_str.clone(),
+			});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				true,
+				CloseInitiator::Unknown,
+				format!("HTLCs timed out (payment_hash: {})", payment_hash_str),
+				false,
+			)
+		},
+		Some(ClosureReason::PeerFeerateTooLow {
+			peer_feerate_sat_per_kw,
+			required_feerate_sat_per_kw,
+		}) => {
+			let reason = ProtoReason::PeerFeerateTooLow(PeerFeerateTooLow {
+				peer_feerate_sat_per_kw: *peer_feerate_sat_per_kw,
+				required_feerate_sat_per_kw: *required_feerate_sat_per_kw,
+			});
+			(
+				events::ClosureReason { reason: Some(reason) },
+				false,
+				CloseInitiator::Counterparty,
+				format!(
+					"Peer feerate too low: {} < required {}",
+					peer_feerate_sat_per_kw, required_feerate_sat_per_kw
+				),
+				false,
+			)
+		},
+		None => (
+			default_reason,
+			false,
+			CloseInitiator::Unknown,
+			"Unknown closure reason".to_string(),
+			false,
+		),
 	}
 }
 

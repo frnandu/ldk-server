@@ -21,5 +21,7 @@ pub(crate) fn get_event_name(event: &event_envelope::Event) -> &'static str {
 		event_envelope::Event::PaymentSuccessful(_) => "PaymentSuccessful",
 		event_envelope::Event::PaymentFailed(_) => "PaymentFailed",
 		event_envelope::Event::PaymentForwarded(_) => "PaymentForwarded",
+		event_envelope::Event::ChannelStateChange(_) => "ChannelStateChange",
+		event_envelope::Event::ChannelClosed(_) => "ChannelClosed",
 	}
 }
